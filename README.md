@@ -1,1 +1,6 @@
-# Batch_distilation
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+plotly>=5.18
+joblib>=1.3

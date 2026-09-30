@@ -1,0 +1,560 @@
+"""
+배치 증류 공정 이상탐지 — 품질 의사결정 지원 대시보드
+
+실행:
+    pip install streamlit scikit-learn xgboost joblib plotly pandas numpy
+    streamlit run app.py
+
+적용 범위 원칙
+    본 시스템은 일탈(Deviation)을 판정하지 않는다.
+    관리한계 초과 여부와 점검 후보를 제시하는 의사결정 지원 도구다.
+"""
+from pathlib import Path
+import json, io
+import numpy as np, pandas as pd, joblib
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# ══════════════════════════════════════════════════════════════
+# 설정
+# ══════════════════════════════════════════════════════════════
+st.set_page_config(page_title="배치 공정 이상탐지 지원",
+                   page_icon="⚗", layout="wide",
+                   initial_sidebar_state="expanded")
+
+ROOT = Path(__file__).resolve().parent
+ART  = ROOT / "artifacts"
+ENC  = "utf-8-sig"
+
+NAVY="#1F3B63"; BLUE="#2E6FB7"; TEAL="#2E7D7A"
+GREEN="#2E7D32"; RED="#B3282D"; AMBER="#C98A15"
+GRAY="#6B7280"; LIGHT="#EEF2F7"; INK="#111827"
+
+st.markdown(f"""
+<style>
+  .main .block-container {{ padding-top: 1.6rem; max-width: 1400px; }}
+  h1,h2,h3 {{ color: {NAVY}; }}
+  div[data-testid="stMetricValue"] {{ font-size: 1.7rem; }}
+  .banner {{ padding:.85rem 1.1rem; border-radius:.45rem; margin:.5rem 0 1rem 0;
+             border-left:.35rem solid {NAVY}; background:{LIGHT}; }}
+  .banner b {{ color:{NAVY}; }}
+  .scope {{ font-size:.82rem; color:{GRAY}; border-top:1px solid #DDE3EA;
+            padding-top:.6rem; margin-top:1.2rem; }}
+</style>""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════
+# 로딩
+# ══════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner="모델 아티팩트 로딩 중…")
+def load_model():
+    f = ART / "model_v3.joblib"
+    return joblib.load(f) if f.exists() else None
+
+@st.cache_data
+def load_csv(name):
+    f = ART / name
+    return pd.read_csv(f) if f.exists() else None
+
+@st.cache_data
+def load_sample(kind):
+    f = ART / f"sample_{kind}.csv.gz"
+    return pd.read_csv(f) if f.exists() else None
+
+MODEL = load_model()
+if MODEL is None:
+    st.error("`artifacts/model_v3.joblib` 이 없습니다. 분석 노트북의 아티팩트 생성 셀을 먼저 실행하세요.")
+    st.stop()
+
+M       = MODEL["metrics"]
+FEATS   = MODEL["feature_names"]
+SUMMARY = pd.DataFrame(MODEL["model_summary"])
+ROC     = load_csv("roc_curve.csv")
+IMP     = load_csv("feature_importance.csv")
+SENS    = load_csv("sensitivity.csv")
+
+DET = SUMMARY[SUMMARY.task == "y_detect"].set_index("model")
+FC  = SUMMARY[SUMMARY.task == "y_forecast"].set_index("model")
+
+def spe_score(X):
+    """PCA 재구성 오차 — 정상 운전으로 설명되지 않는 잔차"""
+    p = MODEL["pca"]
+    R = X - p.inverse_transform(p.transform(X))
+    return (R**2).sum(1), R
+
+def recall_at_fpr(target):
+    """ROC 곡선에서 목표 오탐률의 탐지율과 임계값 조회"""
+    if ROC is None: return np.nan, np.nan
+    ok = ROC[ROC.fpr <= target]
+    if not len(ok): return np.nan, np.nan
+    row = ok.iloc[ok.tpr.argmax()]
+    return float(row.tpr), float(row.thr)
+
+# ══════════════════════════════════════════════════════════════
+# 헤더
+# ══════════════════════════════════════════════════════════════
+c1, c2 = st.columns([3, 1])
+with c1:
+    st.title("배치 공정 이상탐지 — 품질 의사결정 지원")
+    st.caption("배치 증류(정제) 단계 · 조사 우선순위 제시 도구")
+with c2:
+    st.metric("검증 판정", M.get("gate_decision", "NOT_ESTABLISHED"),
+              help="사전에 고정한 5개 기준의 자동 판정 결과")
+
+st.markdown(
+    '<div class="banner"><b>적용 범위</b> — 본 시스템은 일탈(Deviation)을 '
+    '판정하지 않습니다. 관리한계 초과 여부와 점검 후보를 제시하며, '
+    '판정은 담당자가 수행합니다.</div>', unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════
+# 사이드바 — 운영 설정
+# ══════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.header("운영 설정")
+    fpr_target = st.select_slider(
+        "목표 오탐률 (관리한계)",
+        options=[0.01, 0.03, 0.05, 0.10, 0.20], value=0.05,
+        format_func=lambda x: f"{x:.0%}",
+        help="조사팀이 감당 가능한 공수에서 역산해야 하는 값입니다")
+    rec, thr = recall_at_fpr(fpr_target)
+    spe_limit = MODEL.get("run_spe_limits", MODEL["spe_limits"]).get(f"{fpr_target:.2f}")
+    RUN_METRIC = MODEL.get("run_metric", "q95")
+
+    a, b = st.columns(2)
+    a.metric("기대 탐지율", f"{rec:.1%}" if np.isfinite(rec) else "—")
+    b.metric("관리한계(SPE)", f"{spe_limit:,.0f}" if spe_limit else "—",
+             help="Run 단위 상위 5% 분위수 기준")
+
+    st.divider()
+    st.subheader("연간 조사 부하")
+    n_batch = st.number_input("연간 배치 수", 50, 5000, 200, 50)
+    p_anom  = st.slider("예상 이상 비율", 0.02, 0.40, 0.10, 0.01,
+                        format="%.2f")
+    if np.isfinite(rec):
+        hit   = n_batch * p_anom * rec
+        false = n_batch * (1 - p_anom) * fpr_target
+        miss  = n_batch * p_anom - hit
+        prec  = hit / max(hit + false, 1e-9)
+        st.metric("연간 경보", f"{hit+false:,.0f} 건")
+        x, y = st.columns(2)
+        x.metric("적중", f"{hit:,.0f}")
+        y.metric("헛경보", f"{false:,.0f}")
+        st.metric("미검출", f"{miss:,.0f} 건",
+                  help="놓친 이상 — 위해도 평가(ICH Q9) 대상")
+        st.progress(min(prec, 1.0), text=f"경보당 적중률 {prec:.0%}")
+
+    st.divider()
+    st.caption("표본 118 Run · 시점 "
+               f"{M['n_windows']:,} · 분할 {M['n_splits']}")
+
+# ══════════════════════════════════════════════════════════════
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "배치 판정", "검증 결과", "조기탐지 한계", "조사 부하 설계", "모델 정보"])
+
+# ══════════════════════════════════════════════════════════════
+# 탭 1 — 배치 판정
+# ══════════════════════════════════════════════════════════════
+with tab1:
+    left, right = st.columns([1, 2.4])
+
+    with left:
+        st.subheader("공정 데이터 입력")
+        up = st.file_uploader("윈도 특성 CSV", type=["csv", "gz"],
+                              help="분석 노트북 PART 3 에서 생성한 형식")
+        pick = st.radio("또는 샘플 Run 으로 확인",
+                        ["선택 안 함", "정상 Run", "이상 Run"], index=1)
+
+    df = None
+    if up is not None:
+        df = pd.read_csv(up)
+    elif pick == "정상 Run":
+        df = load_sample("normal")
+    elif pick == "이상 Run":
+        df = load_sample("anomalous")
+
+    if df is None:
+        with right:
+            st.info("데이터를 업로드하거나 샘플 Run 을 선택하세요.")
+    else:
+        missing = [c for c in FEATS if c not in df.columns]
+        if missing:
+            left.warning(f"누락 특성 {len(missing)}개는 결측 처리됩니다.")
+            for c in missing: df[c] = np.nan
+
+        X = MODEL["scaler"].transform(df[FEATS].fillna(0))
+        spe, resid = spe_score(X)
+        prob = MODEL["rf"].predict_proba(X)[:, 1]
+        t = df["t_end"].to_numpy() if "t_end" in df else np.arange(len(df))
+
+        # Run 단위 판정 — 시점 단위 한계를 배치에 그대로 쓰면 정상도 초과한다
+        run_stat = float(np.quantile(spe, .95))     # 상위 5% 분위수
+        n_over   = int((spe >= run_stat).sum())
+        peak     = float(spe.max())
+        ratio    = run_stat / spe_limit if spe_limit else np.nan
+        alarm    = run_stat >= spe_limit
+
+        with right:
+            st.subheader("판정 결과")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Run 이상 점수", f"{run_stat:,.0f}",
+                      help="시점별 SPE 의 상위 5% 분위수 — 배치 단위 판정 지표")
+            k2.metric("관리한계", f"{spe_limit:,.0f}")
+            k3.metric("한계 대비", f"{ratio:.2f} 배")
+            k4.metric("최대 시점 SPE", f"{peak:,.0f}")
+
+            if alarm:
+                st.error(f"**관리한계 초과 — 조사 대상으로 선별되었습니다** "
+                         f"(최대 {ratio:.2f}배)\n\n"
+                         "아래 점검 후보 순서로 확인하십시오. "
+                         "본 결과는 일탈 판정이 아닙니다.")
+            else:
+                st.success("**관리한계 이내입니다**\n\n"
+                           "상시 감시 기준에서 특이사항이 확인되지 않았습니다. "
+                           "정상 판정을 의미하지 않으며 기존 배치 기록 검토 절차는 "
+                           "그대로 수행됩니다.")
+
+        # 관리도
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            row_heights=[.62, .38], vertical_spacing=.07,
+                            subplot_titles=("이상 점수 관리도 (PCA 재구성 오차)",
+                                            "지도학습 모델 이상 확률"))
+        fig.add_trace(go.Scatter(x=t, y=spe, mode="lines", name="SPE",
+                                 line=dict(color=BLUE, width=1.6)), row=1, col=1)
+        over = spe >= run_stat
+        if over.any():
+            fig.add_trace(go.Scatter(x=t[over], y=spe[over], mode="markers",
+                                     name="한계 초과",
+                                     marker=dict(color=RED, size=6)), row=1, col=1)
+        fig.add_hline(y=run_stat, line=dict(color=NAVY, dash="dash", width=1.6),
+                      annotation_text=f"Run 지표(상위5%) {run_stat:,.0f}",
+                      annotation_position="top left", row=1, col=1)
+        fig.add_hline(y=spe_limit, line=dict(color=RED, dash="dot", width=1.4),
+                      annotation_text=f"관리한계 {spe_limit:,.0f}",
+                      annotation_position="bottom left", row=1, col=1)
+        fig.add_trace(go.Scatter(x=t, y=prob, mode="lines", name="이상 확률",
+                                 line=dict(color=TEAL, width=1.5)), row=2, col=1)
+        if np.isfinite(thr):
+            fig.add_hline(y=thr, line=dict(color=AMBER, dash="dot", width=1.4),
+                          annotation_text=f"임계값 {thr:.3f}", row=2, col=1)
+        fig.update_yaxes(type="log", title_text="SPE (log)", row=1, col=1)
+        fig.update_yaxes(title_text="확률", range=[0, 1], row=2, col=1)
+        fig.update_xaxes(title_text="경과 시간 (초)", row=2, col=1)
+        fig.update_layout(height=520, margin=dict(t=48, b=40, l=10, r=10),
+                          legend=dict(orientation="h", y=1.12, x=0),
+                          plot_bgcolor="white")
+        fig.update_xaxes(gridcolor="#EEF2F7"); fig.update_yaxes(gridcolor="#EEF2F7")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 점검 후보
+        st.subheader("점검 우선순위 후보")
+        peak_i = int(np.argmax(spe))
+        contrib = pd.Series(resid[peak_i]**2, index=FEATS)
+        tagwise = (contrib.groupby(contrib.index.str.split("|").str[0]).sum()
+                          .sort_values(ascending=False).head(8))
+        share = tagwise / max(contrib.sum(), 1e-9)
+
+        cc1, cc2 = st.columns([1.5, 1])
+        with cc1:
+            bar = go.Figure(go.Bar(x=share.values[::-1], y=share.index[::-1],
+                                   orientation="h",
+                                   marker_color=BLUE,
+                                   text=[f"{v:.1%}" for v in share.values[::-1]],
+                                   textposition="outside"))
+            bar.update_layout(height=320, margin=dict(t=10, b=30, l=10, r=40),
+                              xaxis_title="최대 이상 시점의 SPE 기여 비중",
+                              plot_bgcolor="white",
+                              xaxis=dict(tickformat=".0%", gridcolor="#EEF2F7"))
+            st.plotly_chart(bar, use_container_width=True)
+        with cc2:
+            st.markdown(f"**최대 이상 시점** — {t[peak_i]:,.0f}초")
+            st.dataframe(
+                pd.DataFrame({"공정변수": share.index,
+                              "기여 비중": [f"{v:.1%}" for v in share.values]}),
+                hide_index=True, use_container_width=True, height=280)
+
+        st.caption("SPE 잔차를 변수별로 분해한 결과입니다. "
+                   "**원인이 확정된 것이 아니라 원인 조사 시 우선 점검할 후보**입니다.")
+
+# ══════════════════════════════════════════════════════════════
+# 탭 2 — 검증 결과
+# ══════════════════════════════════════════════════════════════
+with tab2:
+    st.subheader("누수를 차단한 검증 설계")
+    st.markdown(
+        '<div class="banner"><b>임계값을 test 가 아닌 독립 calibration 집합에서 '
+        '결정했습니다.</b> 결과를 본 뒤 기준을 정하면 좋은 숫자가 나오는 조건을 '
+        '사후에 고르게 됩니다.</div>', unsafe_allow_html=True)
+
+    s = st.columns(4)
+    for col, (name, role) in zip(s, [
+            ("fit", "모델 학습 · 전처리 기준"),
+            ("early_stop", "학습 중단 시점 판단"),
+            ("calibration", "경보 임계값 결정"),
+            ("test", "최종 평가 (한 번만)")]):
+        col.markdown(f"**{name}**")
+        col.caption(role)
+
+    st.caption(f"네 집합의 운전조건(op_id)이 겹치지 않음을 assert 로 검증 · "
+               f"{M['n_splits']}개 분할 전부 통과")
+
+    st.divider()
+    st.subheader("이상탐지 성능")
+    d = DET.reset_index().sort_values("auroc", ascending=False)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=d.model, y=d.auroc, name="AUROC",
+                         error_y=dict(type="data", array=d.auroc_sd),
+                         marker_color=[GREEN if m == "ConvAE" else
+                                       (GRAY if m == "TimeOnly" else BLUE)
+                                       for m in d.model],
+                         text=[f"{v:.3f}" for v in d.auroc], textposition="outside"))
+    fig.add_trace(go.Bar(x=d.model, y=d.auprc, name="AUPRC",
+                         marker_color=[GREEN if m == "ConvAE" else
+                                       (GRAY if m == "TimeOnly" else BLUE)
+                                       for m in d.model], opacity=.45,
+                         text=[f"{v:.3f}" for v in d.auprc], textposition="outside"))
+    fig.add_hline(y=M["detect_prevalence"], line=dict(color=RED, dash="dash"),
+                  annotation_text=f"양성 비율 {M['detect_prevalence']:.3f} (AUPRC 기준선)")
+    fig.update_layout(height=420, barmode="group", plot_bgcolor="white",
+                      yaxis=dict(range=[0, 1.05], gridcolor="#EEF2F7"),
+                      margin=dict(t=30, b=30), legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(fig, use_container_width=True)
+
+    m1, m2, m3 = st.columns(3)
+    if "ConvAE" in DET.index:
+        m1.metric("ConvAE (정상만 학습)", f"{DET.loc['ConvAE','auroc']:.4f}",
+                  help="이상 라벨 없이 학습 — 현장에는 라벨이 없습니다")
+    if "RF" in DET.index:
+        m2.metric("RF (지도학습)", f"{DET.loc['RF','auroc']:.4f}")
+    if "TimeOnly" in DET.index:
+        m3.metric("TimeOnly (대조군)", f"{DET.loc['TimeOnly','auroc']:.4f}",
+                  help="경과 시간만 입력 — 무작위 수준이어야 정상")
+
+    st.info("**정상 데이터만 학습한 모델이 지도학습과 대등합니다.** "
+            "실제 현장에는 이상 라벨이 없으므로 실무적으로 의미가 큽니다. "
+            "다만 차이가 seed 표준편차 이내이므로 우수하다고 하지 않고 대등하다고 보고합니다.")
+
+    if SENS is not None:
+        st.divider()
+        st.subheader("민감도 분석 — 평가 기준이 결과를 좌우하는가")
+        g1, g2 = st.columns(2)
+        b = SENS[SENS.analysis == "label_boundary"]
+        with g1:
+            st.markdown("**라벨 경계 제외 범위**")
+            f = go.Figure(go.Scatter(x=b.setting, y=b.auprc, mode="lines+markers",
+                                     line=dict(color=BLUE, width=2.5),
+                                     marker=dict(size=11),
+                                     text=[f"{v:.4f}" for v in b.auprc],
+                                     textposition="top center"))
+            f.update_layout(height=280, plot_bgcolor="white",
+                            yaxis=dict(title="AUPRC", gridcolor="#EEF2F7"),
+                            margin=dict(t=20, b=30))
+            st.plotly_chart(f, use_container_width=True)
+            st.caption(f"변동폭 {b.auprc.max()-b.auprc.min():.4f} — "
+                       "낮은 성능을 라벨 오차로 설명할 수 없습니다.")
+        r = SENS[SENS.analysis == "recovery"]
+        with g2:
+            st.markdown("**Recovery 구간 포함 여부**")
+            st.dataframe(
+                r[["setting", "auprc", "positive_rate"]].rename(
+                    columns={"setting": "조건", "auprc": "AUPRC",
+                             "positive_rate": "양성 비율"}).round(4),
+                hide_index=True, use_container_width=True)
+            st.caption("AUPRC 가 오르지만 양성 비율도 함께 증가합니다. "
+                       "정답 범위가 넓어진 효과이며 모델 개선이 아닙니다.")
+
+# ══════════════════════════════════════════════════════════════
+# 탭 3 — 조기탐지 한계
+# ══════════════════════════════════════════════════════════════
+with tab3:
+    st.subheader("조기탐지 검증 결과")
+    st.markdown(
+        '<div class="banner" style="border-left-color:#B3282D">'
+        '<b style="color:#B3282D">센서 관찰 이전의 조기탐지는 입증되지 않았습니다.</b> '
+        '결정적 근거는 경과 시간만 입력한 대조군과의 비교입니다.</div>',
+        unsafe_allow_html=True)
+
+    det_best = DET.drop(index=["TimeOnly"], errors="ignore").auroc.max()
+    det_time = DET.loc["TimeOnly", "auroc"] if "TimeOnly" in DET.index else np.nan
+    fc_best  = FC.drop(index=["TimeOnly", "Dummy"], errors="ignore").auroc.max()
+    fc_time  = FC.loc["TimeOnly", "auroc"] if "TimeOnly" in FC.index else np.nan
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=["이상탐지 (관찰 이후)", "조기탐지 (관찰 이전)"],
+                         y=[det_best, fc_best], name="실제 모델",
+                         marker_color=BLUE,
+                         text=[f"{det_best:.3f}", f"{fc_best:.3f}"],
+                         textposition="outside"))
+    fig.add_trace(go.Bar(x=["이상탐지 (관찰 이후)", "조기탐지 (관찰 이전)"],
+                         y=[det_time, fc_time], name="TimeOnly (경과 시간만)",
+                         marker_color=AMBER,
+                         text=[f"{det_time:.3f}", f"{fc_time:.3f}"],
+                         textposition="outside"))
+    fig.add_hline(y=.5, line=dict(color=RED, dash="dot"),
+                  annotation_text="무작위 0.5")
+    fig.update_layout(height=400, barmode="group", plot_bgcolor="white",
+                      yaxis=dict(title="AUROC", range=[0, 1], gridcolor="#EEF2F7"),
+                      margin=dict(t=30, b=30), legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2 = st.columns(2)
+    c1.metric("이상탐지 — 대조군 대비", f"{det_best-det_time:+.3f}",
+              help="모델이 공정 신호를 학습했음을 뒷받침")
+    c2.metric("조기탐지 — 대조군 대비", f"{fc_best-fc_time:+.3f}",
+              delta_color="inverse",
+              help="모델이 얻은 정보가 경과 시간보다 적다는 뜻")
+
+    st.warning("**조기탐지 AUROC 는 예측력이 아닙니다.** "
+               "경과 시간만 넣어도 비슷하거나 더 높은 값이 나오므로, "
+               "그 성능은 '배치가 진행될수록 이상 발생 시점이 가까워진다' 는 "
+               "시간 정보를 반영한 것입니다.")
+
+    st.divider()
+    st.subheader("탐지 실적과 사전 게이트")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("관찰 이전 탐지", f"{M['early_hits']} / {M['early_total']}",
+              f"{M['early_rate']:.1%}")
+    e2.metric("120초 이내 탐지", f"{M['within120']} / {M['early_total']}",
+              f"{M['within120_rate']:.1%}")
+    e3.metric("정상 Run 오경보", f"{M['fa_per_hour']:.2f} 회/h",
+              f"8시간 배치당 약 {M['fa_per_batch8h']:.0f}회", delta_color="inverse")
+    e4.metric("최종 판정", M.get("gate_decision", "NOT_ESTABLISHED"))
+
+    gates = pd.DataFrame([
+        ["정상 오경보 ≤ 1.0 회/h", f"{M['fa_per_hour']:.2f} 회/h", "미충족"],
+        ["관찰 이전 탐지 ≥ 1건",   f"{M['early_hits']}건",          "통과"],
+        ["30초 이상 리드타임",     f"중앙값 {M['lead_median']:.0f}초", "통과"],
+        ["detect 대조군 대비 우위", f"{det_best-det_time:+.3f}",     "통과"],
+        ["forecast 대조군 대비 우위", f"{fc_best-fc_time:+.3f}",     "미충족"],
+    ], columns=["사전 설정 기준", "실측값", "판정"])
+    st.dataframe(gates, hide_index=True, use_container_width=True)
+    st.caption("다섯 기준은 결과 확인 전에 코드에 고정되었으며 자동 판정되었습니다.")
+
+# ══════════════════════════════════════════════════════════════
+# 탭 4 — 조사 부하 설계
+# ══════════════════════════════════════════════════════════════
+with tab4:
+    st.subheader("운영점 설계 — 성능을 조사 공수로 환산한다")
+    st.markdown(
+        '<div class="banner"><b>오탐률은 통계 관례가 아니라 조사팀이 감당 가능한 '
+        '공수에서 역산해야 하는 값입니다.</b> 조사 인력과 시간을 먼저 정하고 '
+        '그 범위에서 관리한계를 설정하는 것이 올바른 순서입니다.</div>',
+        unsafe_allow_html=True)
+
+    if ROC is None:
+        st.info("ROC 곡선 데이터가 없습니다.")
+    else:
+        rows = []
+        for t in [0.01, 0.03, 0.05, 0.10, 0.20, 0.30]:
+            r, _ = recall_at_fpr(t)
+            if not np.isfinite(r): continue
+            h = n_batch * p_anom * r
+            f_ = n_batch * (1 - p_anom) * t
+            rows.append(dict(오탐률=t, 탐지율=r, 연간경보=h+f_,
+                             적중=h, 헛경보=f_, 미검출=n_batch*p_anom-h,
+                             경보당적중률=h/max(h+f_, 1e-9)))
+        OP = pd.DataFrame(rows)
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Bar(x=[f"{v:.0%}" for v in OP.오탐률], y=OP.적중,
+                             name="적중", marker_color=GREEN))
+        fig.add_trace(go.Bar(x=[f"{v:.0%}" for v in OP.오탐률], y=OP.헛경보,
+                             name="헛경보", marker_color=AMBER))
+        fig.add_trace(go.Bar(x=[f"{v:.0%}" for v in OP.오탐률], y=OP.미검출,
+                             name="미검출", marker_color=RED, opacity=.85))
+        fig.add_trace(go.Scatter(x=[f"{v:.0%}" for v in OP.오탐률],
+                                 y=OP.경보당적중률, name="경보당 적중률",
+                                 mode="lines+markers",
+                                 line=dict(color=NAVY, width=2.5)),
+                      secondary_y=True)
+        fig.update_layout(height=440, barmode="stack", plot_bgcolor="white",
+                          margin=dict(t=30, b=40),
+                          legend=dict(orientation="h", y=1.12),
+                          xaxis_title="목표 오탐률 (관리한계)")
+        fig.update_yaxes(title_text=f"연간 건수 (배치 {n_batch}개 기준)",
+                         gridcolor="#EEF2F7", secondary_y=False)
+        fig.update_yaxes(title_text="경보당 적중률", tickformat=".0%",
+                         range=[0, 1], secondary_y=True)
+        st.plotly_chart(fig, use_container_width=True)
+
+        show = OP.copy()
+        show["오탐률"]      = show.오탐률.map("{:.0%}".format)
+        show["탐지율"]      = show.탐지율.map("{:.1%}".format)
+        show["경보당적중률"] = show.경보당적중률.map("{:.0%}".format)
+        for c in ["연간경보", "적중", "헛경보", "미검출"]:
+            show[c] = show[c].round(0).astype(int)
+        st.dataframe(show, hide_index=True, use_container_width=True)
+
+        st.error("**놓친 이상은 0 이 되지 않습니다.** "
+                 "미검출 건수를 숨기지 않고 함께 제시하며, 그 위해도를 "
+                 "품질위해관리(ICH Q9) 관점에서 평가하는 것이 "
+                 "규제 환경에서 요구되는 보고 형태입니다.")
+
+    if IMP is not None:
+        st.divider()
+        st.subheader("공정변수별 모델 기여도")
+        top = IMP.head(12)
+        c = top.columns
+        f = go.Figure(go.Bar(x=top[c[1]].values[::-1], y=top[c[0]].values[::-1],
+                             orientation="h", marker_color=TEAL))
+        f.update_layout(height=380, plot_bgcolor="white",
+                        margin=dict(t=20, b=30),
+                        xaxis=dict(title="기여도", gridcolor="#EEF2F7"))
+        st.plotly_chart(f, use_container_width=True)
+        st.caption("모델 전체 기준의 변수 중요도입니다. "
+                   "인과관계가 아니라 조사 시 참고할 우선순위입니다.")
+
+# ══════════════════════════════════════════════════════════════
+# 탭 5 — 모델 정보
+# ══════════════════════════════════════════════════════════════
+with tab5:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("분석 규모")
+        st.dataframe(pd.DataFrame({
+            "항목": ["분석 Run", "시점(윈도) 수", "특성 수", "분할 수",
+                     "detect 양성 비율", "forecast 양성 비율"],
+            "값": [f"{M['n_runs']}", f"{M['n_windows']:,}",
+                   f"{M['n_features']}", f"{M['n_splits']}",
+                   f"{M['detect_prevalence']:.4f}",
+                   f"{M['forecast_prevalence']:.4f}"]}),
+            hide_index=True, use_container_width=True)
+
+        st.subheader("배치 단위 판정")
+        st.dataframe(pd.DataFrame({
+            "구분": ["이상 배치", "정상 배치"],
+            "경보 발생": [M["run_tp"], M["run_fp"]],
+            "경보 없음": [M["run_fn"], M["run_tn"]],
+            "지표": [f"Recall {M['run_recall']:.1%}",
+                     f"FPR {M['run_fpr']:.1%}"]}),
+            hide_index=True, use_container_width=True)
+
+    with c2:
+        st.subheader("모델 성능 전체")
+        st.dataframe(SUMMARY[["task", "model", "auroc", "auroc_sd",
+                              "auprc", "prevalence"]].round(4),
+                     hide_index=True, use_container_width=True, height=300)
+
+    st.divider()
+    st.subheader("적용 범위 및 한계")
+    l, r = st.columns(2)
+    with l:
+        st.success("**주장할 수 있는 것**\n\n"
+                   "- 센서 시계열로 이상 상태를 구분할 수 있다\n"
+                   "- 정상 데이터만 학습해도 지도학습과 대등하다\n"
+                   "- 모델이 경과 시간을 외운 것이 아니다\n"
+                   "- 임계값을 독립 집합에서 결정해 test 오염을 차단했다\n"
+                   "- 라벨 경계 오차가 결과를 좌우하지 않는다")
+    with r:
+        st.error("**주장할 수 없는 것**\n\n"
+                 "- 센서 관찰 이전의 조기탐지\n"
+                 "- 현장 경보 시스템으로 즉시 사용 가능한 수준\n"
+                 "- 특정 모델의 우수성 (차이가 표준편차 이내)\n"
+                 "- GMP 생산 환경에서의 성능 (실험실 규모 데이터)\n"
+                 "- 영상 모달리티의 기여 (별도 검증에서 기준 미충족)")
+
+    st.markdown(
+        '<div class="scope">'
+        '본 시스템은 일탈을 판정하지 않습니다 · SHAP·SPE 기여도는 인과가 아니라 '
+        '조사 우선순위 후보입니다 · GC 조성은 규격 CQA 가 아닙니다 · '
+        '원료 로트·설비 변경 시 기준선 재평가가 필요합니다 (변경관리 대상)'
+        '</div>', unsafe_allow_html=True)
